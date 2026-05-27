@@ -1,0 +1,410 @@
+#include "Renderer.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <complex>
+#include <cstdint>
+#include <iostream>
+#include <random>
+#include <stdexcept>
+#include <thread>
+#include <vector>
+
+namespace {
+constexpr double PI = 3.141592653589793238462643383279502884;
+
+double clamp01(double x) { return std::clamp(x, 0.0, 1.0); }
+
+double smoothstep(double edge0, double edge1, double x) {
+    if (edge1 <= edge0) return (x >= edge1) ? 1.0 : 0.0;
+    double t = clamp01((x - edge0) / (edge1 - edge0));
+    return t * t * (3.0 - 2.0 * t);
+}
+
+double axisMaskFactor(const Vec3& x, const Params& p) {
+    if (!p.axisMaskEnabled) return 1.0;
+
+    // Source-frame cylindrical radius around the z-axis.
+    // This suppresses the visual contribution of the spin-frame/polar-axis seam
+    // without changing the field evaluator itself.
+    double rhoPerp = std::sqrt(x.x * x.x + x.y * x.y);
+    return smoothstep(p.axisMaskInnerRadius, p.axisMaskOuterRadius, rhoPerp);
+}
+
+double hash01(int x, int y, int s, int channel) {
+    // Tiny deterministic integer hash for anti-alias jitter.
+    std::uint32_t v = static_cast<std::uint32_t>(x) * 1973u
+                    ^ static_cast<std::uint32_t>(y) * 9277u
+                    ^ static_cast<std::uint32_t>(s) * 26699u
+                    ^ static_cast<std::uint32_t>(channel) * 31847u
+                    ^ 0x9E3779B9u;
+    v ^= v >> 16;
+    v *= 0x7feb352du;
+    v ^= v >> 15;
+    v *= 0x846ca68bu;
+    v ^= v >> 16;
+    return static_cast<double>(v) / static_cast<double>(0xffffffffu);
+}
+
+bool intersectSphere(const Ray& ray, double radius, double& tEnter, double& tExit) {
+    // Sphere centered at origin. ray.dir should be normalized.
+    double b = dot(ray.origin, ray.dir);
+    double c = dot(ray.origin, ray.origin) - radius * radius;
+    double disc = b * b - c;
+    if (disc < 0.0) return false;
+    double s = std::sqrt(disc);
+    tEnter = -b - s;
+    tExit = -b + s;
+    return tExit >= 0.0;
+}
+
+RGBf hsvToRgb(double h, double s, double v) {
+    h = h - std::floor(h);
+    s = clamp01(s);
+    v = std::max(0.0, v);
+
+    double x = h * 6.0;
+    int i = static_cast<int>(std::floor(x));
+    double f = x - i;
+    double p = v * (1.0 - s);
+    double q = v * (1.0 - s * f);
+    double t = v * (1.0 - s * (1.0 - f));
+
+    switch (i % 6) {
+        case 0: return RGBf{v, t, p};
+        case 1: return RGBf{q, v, p};
+        case 2: return RGBf{p, v, t};
+        case 3: return RGBf{p, q, v};
+        case 4: return RGBf{t, p, v};
+        default: return RGBf{v, p, q};
+    }
+}
+
+RGBf localWaveColor(const std::complex<double>& psi, const Params& p) {
+    double amp = std::abs(psi);
+    if (p.colorMode == "white") {
+        return RGBf{1.0, 0.92, 0.82} * p.waveBrightness;
+    }
+
+    if (p.colorMode == "phase") {
+        double phase = std::atan2(std::imag(psi), std::real(psi));
+        double hue = phase / (2.0 * PI) + 0.5;
+        RGBf c = hsvToRgb(hue, 0.82 * p.colorSaturation, 1.0);
+        return c * p.waveBrightness;
+    }
+
+    double component = (p.colorMode == "signed_imag") ? std::imag(psi) : std::real(psi);
+    double s = (amp > 1e-14) ? std::clamp(component / amp, -1.0, 1.0) : 0.0;
+    double k = std::pow(std::abs(s), std::max(0.0, p.colorSaturation));
+
+    // Neutral is deliberately not pure white; it keeps weak phase regions from looking like flat fog.
+    const RGBf neutral{0.78, 0.68, 0.92};
+    const RGBf positive{1.00, 0.22, 0.55}; // pink/red
+    const RGBf negative{0.36, 0.22, 1.00}; // violet/blue
+
+    RGBf c = (s >= 0.0) ? mixRGB(neutral, positive, k) : mixRGB(neutral, negative, k);
+    return c * p.waveBrightness;
+}
+
+double localDensityFromMaskedAmplitude(double maskedAmp, const Params& p, double frameMax) {
+    double ampNorm = maskedAmp;
+
+    if (p.normalizeAmplitudePerFrame && frameMax > 1e-15) {
+        ampNorm /= frameMax;
+    }
+
+    ampNorm = std::max(0.0, ampNorm);
+
+    // Simple normalized-amplitude cutoff:
+    //   below ampCutoff: invisible
+    //   above ampCutoff: linearly ramp to full normalized amplitude at 1
+    double cutoff = std::clamp(p.ampCutoff, 0.0, 0.999999);
+
+    if (ampNorm <= cutoff) {
+        return 0.0;
+    }
+
+    double t = (ampNorm - cutoff) / (1.0 - cutoff);
+    return p.densityScale * t;
+}
+
+
+RGBf paraviewPeakColor(double scalar, const Params& params) {
+    const double a = params.paraviewPeaksFirstPosition;
+    const double b = params.paraviewPeaksLastPosition;
+
+    double u = 0.0;
+    if (b > a) {
+        u = std::clamp((scalar - a) / (b - a), 0.0, 1.0);
+    }
+
+    // Simple rainbow: blue/violet at low scalar, red at high scalar.
+    double hue = (2.0 / 3.0) * (1.0 - u);
+    return hsvToRgb(hue, 0.95, 1.0) * params.waveBrightness;
+}
+
+double paraviewPeakDensity(double scalar, const Params& params) {
+    if (scalar <= 0.0) return 0.0;
+
+    const int n = std::max(1, params.paraviewPeaksNumPeaks);
+    const double firstPos = params.paraviewPeaksFirstPosition;
+    const double lastPos = params.paraviewPeaksLastPosition;
+    const double firstOpacity = std::max(0.0, params.paraviewPeaksFirstOpacity);
+    const double lastOpacity = std::max(0.0, params.paraviewPeaksLastOpacity);
+
+    double sigma = params.paraviewPeaksSigma;
+    if (!(sigma > 0.0)) {
+        sigma = (n > 1) ? 0.35 * (lastPos - firstPos) / static_cast<double>(n - 1) : 0.01;
+    }
+    sigma = std::max(1.0e-6, sigma);
+
+    const double invTwoSigma2 = 1.0 / (2.0 * sigma * sigma);
+
+    double density = 0.0;
+    for (int i = 0; i < n; ++i) {
+        double u = (n > 1) ? static_cast<double>(i) / static_cast<double>(n - 1) : 0.0;
+        double pos = firstPos + (lastPos - firstPos) * u;
+        double op = firstOpacity + (lastOpacity - firstOpacity) * u;
+        double d = scalar - pos;
+        density += op * std::exp(-(d * d) * invTwoSigma2);
+    }
+
+    return std::max(0.0, params.paraviewPeaksStrength) * density;
+}
+
+Vec3 randomPointInWaveSphere(std::mt19937_64& rng, double rInner, double rOuter) {
+    std::uniform_real_distribution<double> U(0.0, 1.0);
+
+    double z = 2.0 * U(rng) - 1.0;
+    double phi = 2.0 * PI * U(rng);
+    double rho = std::sqrt(std::max(0.0, 1.0 - z * z));
+
+    double r3Inner = rInner * rInner * rInner;
+    double r3Outer = rOuter * rOuter * rOuter;
+    double r = std::cbrt(r3Inner + (r3Outer - r3Inner) * U(rng));
+
+    return Vec3(
+        r * rho * std::cos(phi),
+        r * rho * std::sin(phi),
+        r * z
+    );
+}
+
+} // namespace
+
+Renderer::Renderer(const Params& params, const Scene& scene)
+    : params_(params), scene_(scene)
+{
+    if (params_.renderMode != "fog" && params_.renderMode != "paraview_peaks") {
+        throw std::runtime_error("Unknown Params::renderMode: " + params_.renderMode +
+                                 " (expected \"fog\" or \"paraview_peaks\")");
+    }
+
+    frameAmplitudeMax_ = estimateFrameAmplitudeMax();
+    frameRealMax_ = estimateFrameRealMax();
+
+    if (params_.normalizeAmplitudePerFrame) {
+        std::cerr << "Frame amplitude max = " << frameAmplitudeMax_ << "\n";
+        if (params_.renderMode == "paraview_peaks") {
+            std::cerr << "Frame real max = " << frameRealMax_ << "\n";
+        }
+    }
+}
+
+double Renderer::estimateFrameAmplitudeMax() const {
+    if (!params_.normalizeAmplitudePerFrame) return 1.0;
+
+    int n = std::max(1000, params_.frameAmplitudeSampleCount);
+    double maxAmp = 0.0;
+
+    std::mt19937_64 rng(123456789ULL);
+
+    for (int i = 0; i < n; ++i) {
+        Vec3 x = randomPointInWaveSphere(rng, std::max(0.0, params_.rInner), params_.waveVolumeRadius);
+        std::complex<double> psi = scene_.field.eval(x, params_.time);
+        double maskedAmp = std::abs(psi) * axisMaskFactor(x, params_);
+        maxAmp = std::max(maxAmp, maskedAmp);
+    }
+
+    if (!std::isfinite(maxAmp) || maxAmp <= 1e-15) maxAmp = 1.0;
+    return maxAmp;
+}
+
+double Renderer::estimateFrameRealMax() const {
+    int n = std::max(1000, params_.frameAmplitudeSampleCount);
+    double maxRe = 0.0;
+
+    std::mt19937_64 rng(987654321ULL);
+
+    for (int i = 0; i < n; ++i) {
+        Vec3 x = randomPointInWaveSphere(rng, std::max(0.0, params_.rInner), params_.waveVolumeRadius);
+        std::complex<double> psi = scene_.field.eval(x, params_.time);
+        maxRe = std::max(maxRe, std::abs(std::real(psi)));
+    }
+
+    if (!std::isfinite(maxRe) || maxRe <= 1e-15) maxRe = 1.0;
+    return maxRe;
+}
+
+
+RGBf shadeParaviewPeaksRay(const Ray& ray,
+                           const Params& params,
+                           const Scene& scene,
+                           double frameRealMax)
+{
+    double tEnter = 0.0;
+    double tExit = 0.0;
+    bool hitWaveSphere = intersectSphere(ray, params.waveVolumeRadius, tEnter, tExit);
+
+    RGBf accum{0.0, 0.0, 0.0};
+    double T = 1.0;
+
+    if (hitWaveSphere) {
+        double s0 = std::max({tEnter, params.rayTMin, 0.0});
+        double s1 = std::min(tExit, params.rayTMax);
+
+        if (s1 > s0) {
+            const double realScale = std::max(frameRealMax, 1.0e-15);
+
+            for (double s = s0; s <= s1; s += params.stepSize) {
+                Vec3 x = ray.origin + s * ray.dir;
+                std::complex<double> psi = scene.field.eval(x, params.time);
+
+                double scalar = std::real(psi) / realScale;
+                double density = paraviewPeakDensity(scalar, params);
+
+                if (density > 0.0) {
+                    density *= axisMaskFactor(x, params);
+
+                    if (density > 0.0) {
+                        RGBf c = paraviewPeakColor(scalar, params);
+
+                        double alpha = 1.0 - std::exp(-density * params.stepSize);
+                        alpha = std::clamp(alpha, 0.0, params.maxStepAlpha);
+
+                        accum += T * alpha * c;
+                        T *= (1.0 - alpha);
+
+                        if (T <= params.transmittanceCutoff) break;
+                    }
+                }
+            }
+        }
+    }
+
+    RGBf bg = scene.panorama.sampleDirection(ray.dir, params.panoramaYawDegrees, params.panoramaExposure);
+    accum += T * bg;
+    return accum;
+}
+
+RGBf Renderer::shadeRay(const Ray& ray) const {
+    if (params_.renderMode == "paraview_peaks") {
+        return shadeParaviewPeaksRay(ray, params_, scene_, frameRealMax_);
+    }
+
+    double tEnter = 0.0;
+    double tExit = 0.0;
+    bool hitWaveSphere = intersectSphere(ray, params_.waveVolumeRadius, tEnter, tExit);
+
+    RGBf accum{0.0, 0.0, 0.0};
+    double T = 1.0; // remaining transparency from camera to current sample.
+
+    if (hitWaveSphere) {
+        double s0 = std::max({tEnter, params_.rayTMin, 0.0});
+        double s1 = std::min(tExit, params_.rayTMax);
+
+        if (s1 > s0) {
+            for (double s = s0; s <= s1; s += params_.stepSize) {
+                Vec3 x = ray.origin + s * ray.dir;
+                std::complex<double> psi = scene_.field.eval(x, params_.time);
+
+                double maskedAmp = std::abs(psi) * axisMaskFactor(x, params_);
+                double density = localDensityFromMaskedAmplitude(maskedAmp, params_, frameAmplitudeMax_);
+
+                if (density > 0.0) {
+                    double alpha = 1.0 - std::exp(-density * params_.stepSize);
+                    alpha = std::clamp(alpha, 0.0, params_.maxStepAlpha);
+
+                    RGBf c = localWaveColor(psi, params_);
+
+                    // Front-to-back emission/absorption compositing.
+                    accum += T * alpha * c;
+                    T *= (1.0 - alpha);
+
+                    if (T <= params_.transmittanceCutoff) break;
+                }
+            }
+        }
+    }
+
+    RGBf bg = scene_.panorama.sampleDirection(ray.dir, params_.panoramaYawDegrees, params_.panoramaExposure);
+    accum += T * bg;
+    return accum;
+}
+
+RGB8 Renderer::shadePixel(const Camera& camera, int x, int y) const {
+    if (params_.samplesPerPixel <= 1) {
+        Ray ray = camera.generateRay(static_cast<double>(x), static_cast<double>(y), params_.width, params_.height);
+        return makeRGB(shadeRay(ray), params_.outputGamma);
+    }
+
+    int root = static_cast<int>(std::floor(std::sqrt(static_cast<double>(params_.samplesPerPixel))));
+    if (root < 1) root = 1;
+    int spp = root * root;
+
+    RGBf sum{0.0, 0.0, 0.0};
+    int index = 0;
+    for (int sy = 0; sy < root; ++sy) {
+        for (int sx = 0; sx < root; ++sx) {
+            double jx = hash01(x, y, index, 0);
+            double jy = hash01(x, y, index, 1);
+            double px = static_cast<double>(x) + (static_cast<double>(sx) + jx) / static_cast<double>(root) - 0.5;
+            double py = static_cast<double>(y) + (static_cast<double>(sy) + jy) / static_cast<double>(root) - 0.5;
+            Ray ray = camera.generateRay(px, py, params_.width, params_.height);
+            sum += shadeRay(ray);
+            ++index;
+        }
+    }
+
+    sum = sum * (1.0 / static_cast<double>(spp));
+    return makeRGB(sum, params_.outputGamma);
+}
+
+Image Renderer::render(const Camera& camera) const {
+    Image img(params_.width, params_.height);
+
+    int nThreads = params_.numThreads;
+    if (nThreads <= 0) {
+        nThreads = static_cast<int>(std::thread::hardware_concurrency());
+        if (nThreads <= 0) nThreads = 1;
+    }
+
+    std::atomic<int> nextRow{0};
+    std::atomic<int> rowsDone{0};
+
+    auto worker = [&]() {
+        while (true) {
+            int y = nextRow.fetch_add(1);
+            if (y >= params_.height) break;
+
+            for (int x = 0; x < params_.width; ++x) {
+                img.at(x, y) = shadePixel(camera, x, y);
+            }
+
+            int done = rowsDone.fetch_add(1) + 1;
+            if (done % 20 == 0 || done == params_.height) {
+                std::cerr << "Rendered row " << done << " / " << params_.height << "\r" << std::flush;
+            }
+        }
+    };
+
+    std::cerr << "Rendering with " << nThreads << " threads...\n";
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<std::size_t>(nThreads));
+    for (int i = 0; i < nThreads; ++i) threads.emplace_back(worker);
+    for (auto& t : threads) t.join();
+    std::cerr << "\n";
+
+    return img;
+}

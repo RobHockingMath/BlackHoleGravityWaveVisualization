@@ -1,0 +1,366 @@
+#pragma once
+
+#include <cmath>
+#include <limits>
+#include <string>
+#include <vector>
+
+struct ModeKey {
+    int l = 0;
+    int m = 0;
+};
+
+inline bool operator==(const ModeKey& a, const ModeKey& b) {
+    return a.l == b.l && a.m == b.m;
+}
+
+struct Params {
+    // Image / output.
+    int width = 640*1;
+    int height = 640*1;
+    int numThreads = 0;        // 0 means auto.
+    int samplesPerPixel = 1;   // 1 = no AA. 4/9/16 give stratified supersampling.
+
+    // Files.
+    std::string outputPath = "gravity_wave_volume.png";
+    //std::string modeFile = "modes_psi4_multiradius_l4.txt";
+    std::string modeFile = "modes_strain_multiradius_l4.txt";
+    std::string panoramaPath = "panorama.jpeg";
+
+    // Render mode.
+    //
+    // "fog":
+    //   Original ray-marched emission/absorption volume render.
+    //
+    // "paraview_peaks":
+    //   Known-good constant-step ParaView/gwpv-style peaked transfer function on
+    //   S(x,t)=Re(F(x,t))/max_x|Re(F(x,t))|. This is the default here.
+    //
+    // "paraview_peaks_adaptive":
+    //   Conservative empty-space skipping version. It keeps the normal fixed
+    //   step wherever S is near a transfer-function peak and only skips through
+    //   scalar-space regions that are safely outside the visible bands.
+    //
+    // "gwpv_peaks":
+    //   Diagnostic mode for this project: use the existing GravityWaveField
+    //   evaluator and absolute scalar levels of rDisplay*Re(Psi4), but use the
+    //   asymmetric piecewise-linear ParaView/GWPV Peaks opacity function instead
+    //   of the old symmetric Gaussian approximation. No frameRealMax(t)
+    //   normalization is applied in this mode.
+    std::string renderMode = "gwpv_peaks"; // fog, paraview_peaks, paraview_peaks_adaptive, gwpv_peaks
+
+    // Ray marching. The finite wave sphere normally clips the march interval.
+    double stepSize = 1.0;
+    double rayTMin = 0.0;
+    double rayTMax = std::numeric_limits<double>::infinity();
+    double waveVolumeRadius = 420.0;
+    double transmittanceCutoff = 0.003; // early stop when remaining transparency falls below this.
+
+    // Simulation time for the current frame. main_gravity_wave.cpp sets this per frame.
+    double time = std::numeric_limits<double>::quiet_NaN();
+
+    // Extraction spheres. All true by default so the renderer uses the full radial data.
+    // Toggle these to compare how many extraction spheres affect the result.
+    /**bool use_extraction_sphere_100 = true;
+    bool use_extraction_sphere_115 = true;
+    bool use_extraction_sphere_136 = true;
+    bool use_extraction_sphere_167 = true;
+    bool use_extraction_sphere_214 = true;
+    bool use_extraction_sphere_300 = true;
+    bool use_extraction_sphere_500 = true;**/
+    
+    bool use_extraction_sphere_100 = true;
+    bool use_extraction_sphere_115 = false;
+    bool use_extraction_sphere_136 = false;
+    bool use_extraction_sphere_167 = false;
+    bool use_extraction_sphere_214 = false;
+    bool use_extraction_sphere_300 = false;
+    bool use_extraction_sphere_500 = false;
+
+    // Optional harmonic filter. Empty means use all modes present in modeFile.
+    // For the current GWPV-style tuning pass we default to all modes.
+    std::vector<ModeKey> activeModes = {
+        ModeKey{2, 2},  ModeKey{2, -2},
+        ModeKey{3, 3},  ModeKey{3, -3},
+        ModeKey{4, 4},  ModeKey{4, -4}
+    };
+
+    // The multi-radius field uses retarded-time interpolation between extraction spheres.
+    // For r below the innermost enabled extraction sphere, the renderer inward-continues
+    // the wave-zone scaling but caps the 1/r amplification at innerWaveScaleRadius.
+    double rInner = 0.01;
+    double innerWaveScaleRadius = 15.0;  // option 2: capped inward 1/r continuation.
+
+    // Optional tortoise-radius retarded-time reconstruction.
+    // Off recovers the old flat outgoing-wave alignment:
+    //     u = t - r,        T_R = u + R
+    // On uses a Schwarzschild-like tortoise radius:
+    //     r* = r + 2M log(r/(2M)-1)
+    //     u = t - r*(r),    T_R = u + r*(R)
+    // The radius floor avoids the r=2M singularity in the artificial inward
+    // continuation region; for this renderer, innerWaveScaleRadius is a sane default.
+    bool useTortoiseRetardedTime = true;
+    double tortoiseMass = 1.0;
+    double tortoiseRadiusFloor = 15.0;
+    double tortoiseSafetyEps = 1.0e-6;
+
+    // Panorama / background sphere.
+    double panoramaYawDegrees = 0.0;
+    double panoramaExposure = 1.0;
+
+    // Volume opacity.
+    //
+    // SIMPLE MODEL:
+    //   frameMax  = max over sampled volume of |Psi4| * axisMask
+    //   localAmp  = |Psi4| * axisMask
+    //   ampNorm   = localAmp / frameMax
+    //   if ampNorm <= ampCutoff: density = 0
+    //   else density = densityScale * (ampNorm - ampCutoff) / (1 - ampCutoff)
+    double densityScale = 0.01;
+    double ampCutoff = 0.02;       // normalized amplitude cutoff after frame max normalization.
+    double maxStepAlpha = 0.20;
+
+    // Per-frame amplitude normalization.
+    bool normalizeAmplitudePerFrame = true;
+    int frameAmplitudeSampleCount = 30000;   // random sample points used to estimate frameMax.
+
+    // Smooth cylindrical seam mask around the source-frame z axis.
+    // This is a rendering artifact fix only: it reduces opacity contribution near x=y=0.
+    bool axisMaskEnabled = true;
+    double axisMaskInnerRadius = 4.0;
+    double axisMaskOuterRadius = 25.0;
+
+    // Local wave color. This is evaluated at each sample before compositing.
+    std::string colorMode = "signed_real"; // signed_real, signed_imag, phase, white
+    double colorSaturation = 1.0;
+    double waveBrightness = 1.0;
+
+    // ParaView/gwpv-style peaked scalar transfer function.
+    //
+    // The renderer evaluates:
+    //
+    //   S(x,t) = Re(F(x,t)) / max_x |Re(F(x,t))|
+    //
+    // and applies several positive opacity peaks between FirstPosition
+    // and LastPosition. Color is a simple rainbow map over that same range.
+    //
+    // These are the restored known-good values for this renderer.  In
+    // particular, sigma=0.005 is look-critical; sigma=0.05 makes the result
+    // washed-out/blue because the Gaussian opacity peaks become far too broad.
+    int paraviewPeaksNumPeaks = 5;
+    double paraviewPeaksFirstPosition = 0.15;
+    double paraviewPeaksLastPosition = 0.60;
+    double paraviewPeaksFirstOpacity = 0.10*1;//(0.005/0.0075);
+    double paraviewPeaksLastOpacity = 0.50*1;//(0.005/0.0075);
+
+    // <= 0 means choose a narrow width from the peak spacing.  The current
+    // known-good look uses the explicit value below.
+    double paraviewPeaksSigma = 0.005*1;//(0.0075/0.005);
+
+    double paraviewPeaksStrength = 1.0;
+    double paraviewScalarOpacityUnitDistance = 4.0;
+
+    // ParaView scalar radial display mode.
+    //
+    // "psi4":
+    //   Use Re(Psi4-like reconstructed field) for transfer-function peaks,
+    //   color, normalization, and adaptive stepping. This preserves the
+    //   restored known-good look.
+    //
+    // "r_psi4":
+    //   Use rDisplay * Re(Psi4), where rDisplay=max(r, innerWaveScaleRadius).
+    //   This approximately visualizes the radius-rescaled waveform and removes
+    //   the artificial inward 1/r strengthening from the displayed scalar.
+    std::string paraviewScalarRadialMode = "r_psi4"; // psi4, r_psi4
+
+    // Optional opacity-only radial envelope for the ParaView peak modes.
+    // These do NOT change which scalar level sets are colored/rendered; they
+    // only multiply opacity after the peak transfer function is evaluated.
+    // Defaults preserve the existing known-good look.
+    bool paraviewOpacityRadialFalloffEnabled = true;
+    double paraviewOpacityReferenceRadius = 100.0; // opacity is unchanged for r <= this
+    double paraviewOpacityFalloffPower = 1.0;      // 1 gives ~1/r beyond the reference radius
+    double paraviewOuterFadeWidth = 0.0;           // 0 disables; try 40.0 to fade near waveVolumeRadius
+
+    // Conservative adaptive empty-space skipping knobs for
+    // renderMode="paraview_peaks_adaptive".  These should not affect
+    // renderMode="paraview_peaks" at all.
+    double paraviewAdaptiveMaxStep = 8.0;             // start conservative; try 4.0 later if it matches
+    double paraviewAdaptiveSafetyFactor = 0.50;      // scalar-distance step is multiplied by this
+    double paraviewAdaptiveFineBandSigmas = 5.0;     // use fixed step inside peak +/- this*sigma
+    double paraviewAdaptiveDerivativeFloor = 1.0e-4; // prevents huge jumps near dS/ds ~= 0
+
+    // GWPV/ParaView-style asymmetric Peaks transfer function, applied to the
+    // same absolute display scalar used by paraview_peaks:
+    //
+    //   S(x,t) = rDisplay * Re(Psi4)      when paraviewScalarRadialMode="r_psi4"
+    //
+    // No frame-real normalization is applied in renderMode="gwpv_peaks". These
+    // positions are therefore absolute scalar values for this dataset, not
+    // fractions of a per-frame maximum. The defaults start from the previously
+    // useful 0.15..0.60 scalar range, but use the actual GWPV peak shape.
+    /**int gwpvPeaksNumPeaks = 11;
+    double gwpvPeaksFirstPosition = 0.15;
+    double gwpvPeaksLastPosition = 0.60;
+    double gwpvPeaksFirstOpacity = 0.16;
+    double gwpvPeaksLastOpacity = 0.50;
+    double gwpvPeaksStrength = 0.12;**/
+    double gwpvScalarOpacityUnitDistance = 4.0;
+    
+    /**int gwpvPeaksNumPeaks = 7;
+    double gwpvPeaksFirstPosition = 0.03;
+    double gwpvPeaksLastPosition = 0.12;
+    double gwpvPeaksFirstOpacity = 0.10;
+    double gwpvPeaksLastOpacity = 0.50;
+    double gwpvPeaksStrength = 0.12;**/
+    
+    /**int gwpvPeaksNumPeaks = 9;
+    double gwpvPeaksFirstPosition = 0.03;
+    double gwpvPeaksLastPosition = 0.08;
+    double gwpvPeaksFirstOpacity = 0.10;
+    double gwpvPeaksLastOpacity = 0.50;
+    double gwpvPeaksStrength = 0.12;**/
+    /**int gwpvPeaksNumPeaks = 9;
+    double gwpvPeaksFirstPosition = 0.03;
+    double gwpvPeaksLastPosition = 0.12;
+    double gwpvPeaksFirstOpacity = 0.08;
+    double gwpvPeaksLastOpacity = 0.60;
+    double gwpvPeaksStrength = 0.12;**/
+    
+    int gwpvPeaksNumPeaks = 11;
+    double gwpvPeaksFirstPosition = 0.03;
+    //double gwpvPeaksLastPosition = 0.12;
+    //double gwpvPeaksLastPosition = 0.10;
+    double gwpvPeaksLastPosition = 0.11;
+    double gwpvPeaksFirstOpacity = 0.07;
+    double gwpvPeaksLastOpacity = 0.60;
+    double gwpvPeaksStrength = 0.12;
+
+    // Smooth time-dependent opacity gain for gwpv_peaks.
+    // This multiplies opacity strength only; it does NOT rescale the scalar
+    // field or move the absolute contour/peak levels.
+    bool gwpvOpacityGainEnabled = false;
+    std::string gwpvOpacityGainCsvPath = "image_brightness_diagnostics/image_brightness_diagnostics.csv";
+    double gwpvOpacityGainMultiplier = 1.0;
+
+    // Local retarded-time wavelength-shortening compensation for gwpv_peaks.
+    // The CSV is expected to come from extract_wavelength_22.py and contain at
+    // least columns "time" and "wavelength_gain", where wavelength_gain was
+    // generated using some base exponent (typically 0.5). We reconstruct the
+    // underlying wavelength-shortening ratio by dividing out that base power,
+    // then apply the tunable powers below.
+    bool gwpvWavelengthCompEnabled = false;
+    std::string gwpvWavelengthCsvPath = "wavelength_diagnostics_22/wavelength_gain_table.csv";
+    double gwpvWavelengthCsvBasePower = 0.5;    // exponent used when the CSV wavelength_gain column was created
+    double gwpvWavelengthReferenceRadius = 100.0; // retarded-time lookup uses t_lookup = frameTime + Rref - r
+
+    // The first ramp/plateau from the wavelength diagnostic is always kept. A
+    // possible second ramp/plateau can be toggled. When disabled, the gain is
+    // frozen at secondPlateauStartTime. When enabled, values between Start/End
+    // are linearly interpolated, then held fixed for all later times. This lets
+    // us ignore the noisy far-right tail of the raw frequency diagnostic.
+    bool gwpvWavelengthSecondPlateauEnabled = false;
+    double gwpvWavelengthSecondPlateauStartTime = 1125.0;
+    double gwpvWavelengthSecondPlateauEndTime = 1185.0;
+
+    // Tunable local opacity compensation based on the cleaned wavelength ratio.
+    double gwpvWavelengthOpacityPower = 0.5;
+    double gwpvWavelengthOpacityGainMin = 1.0;
+    double gwpvWavelengthOpacityGainMax = 4.0;
+    double gwpvWavelengthColorPower = 0.5;
+    double gwpvWavelengthColorGainMin = 1.0;
+    double gwpvWavelengthColorGainMax = 4.0;
+    // Optional local widening of the transfer-function layers as wavelength
+    // shortens. This keeps the physical shell thickness from collapsing.
+    bool gwpvWavelengthPeakWidthEnabled = false;
+    double gwpvWavelengthPeakWidthPower = 0.5;
+    double gwpvWavelengthPeakWidthGainMin = 1.0;
+    double gwpvWavelengthPeakWidthGainMax = 4.0;
+
+    // Optional local step-size shrinkage, again based on the cleaned local
+    // wavelength ratio. This does NOT force a global frame-wide smaller step;
+    // it is evaluated locally along the ray using the local retarded time.
+    bool gwpvWavelengthStepScalingEnabled = false;
+    double gwpvWavelengthStepPower = 1.0;
+    double gwpvWavelengthMinStep = 0.25/8;
+    double gwpvWavelengthMaxSkipMultiplier = 8.0; // adaptive empty-space skips are capped to this many local steps
+
+    // Rendering modifiers for gwpv_peaks. The axis mask is kept on by default
+    // because it suppresses our spin-frame seam. The old radial opacity falloff
+    // is enabled here because the full 420-radius wave volume otherwise gets too optically thick.
+    bool gwpvUseAxisMask = true;
+    bool gwpvUseOpacityRadialEnvelope = true;
+
+    // Adaptive empty-space skipping for renderMode="gwpv_peaks".
+    // This uses the same derivative predictor as paraview_peaks_adaptive, but
+    // with guard bands built from the asymmetric GWPV peak support.  Larger
+    // guard values are safer and less likely to flicker; smaller values skip more.
+    bool gwpvAdaptiveEnabled = true;
+    double gwpvAdaptiveGuardPeakDecays = 0.5;
+
+
+    // Frozen-strain metric lensing prototype.
+    // This traces rays through a frozen spatial metric
+    //     gamma_ij = delta_ij + metricPerturbationScale * hTT_ij(x, frameTime)
+    // using an adaptive RK45 integrator. Color/opacity is then accumulated along
+    // each accepted geodesic segment using metricColorStep.
+    bool metricLensingEnabled = true;
+    bool metricUseRadiusScaledStrain = true; // true: use rDisplay*h; false: use raw h
+    double metricPerturbationScale = 1.0;
+    // Prefer analytic spatial derivatives of the frozen strain metric.
+    // Set false to fall back to centered finite differences for comparison.
+    bool metricUseAnalyticDerivatives = true;
+    double metricDerivativeEps = 0.5;        // finite-difference spacing when analytic derivatives are off/fallback
+
+    double metricGeodesicInitialStep = 1.0;
+    double metricGeodesicMinStep = 0.03125;
+    // Radial cap for adaptive geodesic RK step size.
+    // For r <= metricGeodesicMaxStepInnerRadius, use metricGeodesicMaxStepInner.
+    // For r >= metricGeodesicMaxStepOuterRadius, use metricGeodesicMaxStepOuter.
+    // Smoothly interpolate between the two radii.
+    double metricGeodesicMaxStepInner = 1.0;
+    double metricGeodesicMaxStepOuter = 10.0;
+    double metricGeodesicMaxStepInnerRadius = 15.0;
+    double metricGeodesicMaxStepOuterRadius = 25.0;
+    double metricGeodesicAbsTol = 1.0e-5;
+    double metricGeodesicRelTol = 1.0e-4;
+    //double metricGeodesicAbsTol = 1.0e-3;
+    //double metricGeodesicRelTol = 1.0e-2;
+    int metricMaxAcceptedSteps = 20000;
+
+    double metricColorStep = 1.0;//0.125;
+    bool metricRenormalizeNullSpeed = true;
+
+
+    // Black-hole marker / capture / MP optical-metric prototype.
+    // The trajectory CSV is expected to live beside the executable and to contain:
+    //   time,x_rel,y_rel,z_rel,separation
+    // where rel = x_plus - x_minus. Individual positions are reconstructed by
+    // keeping the center of mass at the origin using the masses below.
+    bool blackHolesEnabled = true;
+    std::string blackHoleTrajectoryCsvPath = "reftrajectories_with_time.csv";
+    std::string blackHoleTexturePath = "black_sphere_texture.png";
+
+    double blackHolePlusMass = 36.0 / 65.0;
+    double blackHoleMinusMass = 29.0 / 65.0;
+
+    // Render/capture radii are scale * mass. 2.0 gives Schwarzschild-like 2M spheres.
+    double blackHoleRenderRadiusScale = 2.0*2;
+    double blackHoleCaptureRadiusScale = 2.0*0.5;
+
+    // Majumdar-Papapetrou-like optical metric factor for metric lensing:
+    //   ds^2 = -U^-2 dt^2 + U^2 dx^2, so null rays see gamma_ij = U^4 delta_ij.
+    // We combine it with the strain optical metric as:
+    //   gamma_ij = U^4 (delta_ij + A hTT_ij).
+    bool metricUseMajumdarPapapetrou = true;
+    double metricMPMassScale = 1.0*3;
+    double metricMPSoftening = 0.0;
+
+    // Output transform. 1.0 means do not gamma-bend the final RGB.
+    double outputGamma = 1.0;
+
+    // Mode coefficient normalization for display. This is not physical; it makes the image robust.
+    bool autoNormalizeModes = false;
+};
+
+void printParams(const Params& p);
